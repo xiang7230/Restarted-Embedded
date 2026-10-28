@@ -1,132 +1,106 @@
 #include "robot_line.h"
 #include "../subsystem2/robot_motion.h"
-
-/* Verify IR sensor levels on your physical module. */
+/* Set this to 0 if the sensor reports LOW over black. */
 #define IR_BLACK_LEVEL 1U
 #define IR_L 2U
 #define IR_C 6U
 #define IR_R 27U
-#define LINE_PERIOD_MS 20U
-#define SEARCH_TIMEOUT_MS 3000U
-#define RECOVERY_TIMEOUT_MS 3000U
-#define LOST_SAMPLES 3
-#define FOUND_SAMPLES 3
-/* Wheel percentages: cap is enforced by Buddy 2. */
-#define CRUISE 15
-#define STEER_SLOW 10
-#define SEARCH 10
-
+#define PERIOD_MS 20U
+#define STARTUP_SETTLE_MS 800U
+#define STARTUP_OBSERVE_MS 240U
+#define SEARCH_LIMIT_MS 2500U
+#define RECOVERY_LIMIT_MS 2500U
+#define CONFIRM_SAMPLES 3U
+#define LOSS_SAMPLES 3U
+/* Conservative starting values: adjust for motor minimum running PWM. */
+#define CRUISE 24
+#define SLOW 17
+#define SWEEP 18
 static volatile robot_line_state_t state;
-static unsigned state_elapsed;
-static unsigned seen;
-static unsigned lost;
-static int last_direction;
-static ID line_tid;
-
-int robot_line_is_faulted(void) { return state == ROBOT_STOPPED; }
-robot_line_state_t robot_line_state(void) { return state; }
-
-static void set_state(robot_line_state_t s)
-{
-    state=s;
-    state_elapsed=0;
-    seen=0;
-    lost=0;
+static unsigned elapsed, present, absent;
+static int last_side;
+static ID tid_line;
+static void enter(robot_line_state_t s) {
+    state=s; elapsed=present=absent=0;
+    tm_printf((UB*)"[LINE] state=%d\n",(int)s);
 }
-static unsigned sample_bits(void)
-{
-    unsigned b=0;
-    if (gpio_get_val(IR_L) == IR_BLACK_LEVEL) b |= 4U;
-    if (gpio_get_val(IR_C) == IR_BLACK_LEVEL) b |= 2U;
-    if (gpio_get_val(IR_R) == IR_BLACK_LEVEL) b |= 1U;
-    return b;
+int robot_line_is_faulted(void){ return state==ROBOT_STOPPED; }
+robot_line_state_t robot_line_state(void){ return state; }
+static unsigned read_line(void){
+    unsigned r=0;
+    if(gpio_get_val(IR_L)==IR_BLACK_LEVEL) r|=4U;
+    if(gpio_get_val(IR_C)==IR_BLACK_LEVEL) r|=2U;
+    if(gpio_get_val(IR_R)==IR_BLACK_LEVEL) r|=1U;
+    return r;
 }
-static void line_task(INT stacd, void *exinf)
-{
-    unsigned bits;
-    (void)stacd; (void)exinf;
-    tk_dly_tsk(250U); /* allow sensor power to stabilize */
-    set_state(ROBOT_STARTUP);
-    for (;;) {
-        bits=sample_bits();
-        if (state_elapsed < 1000000U) state_elapsed+=LINE_PERIOD_MS;
-        if (state == ROBOT_STARTUP) {
-            if (bits != 0U && bits != 5U) {
-                if (++seen >= FOUND_SAMPLES) set_state(ROBOT_FOLLOW);
-            } else if (state_elapsed >= 200U) {
-                set_state(ROBOT_INITIAL_SEARCH);
-            }
-            robot_motion_command(0,0);
-        } else if (state == ROBOT_FOLLOW) {
-            if (bits == 0U) {
-                if (++lost >= LOST_SAMPLES) {
-                    set_state(ROBOT_RECOVERY);
-                    robot_motion_command(0,0);
-                }
-            } else {
-                lost=0;
-                if (bits == 4U || bits == 6U) last_direction=-1;
-                if (bits == 1U || bits == 3U) last_direction=1;
-                if (bits == 2U) last_direction=0;
-                if (bits == 4U || bits == 6U)
-                    robot_motion_command(STEER_SLOW, CRUISE);
-                else if (bits == 1U || bits == 3U)
-                    robot_motion_command(CRUISE, STEER_SLOW);
-                else if (bits == 2U)
-                    robot_motion_command(CRUISE, CRUISE);
-                else
-                    robot_motion_command(STEER_SLOW,STEER_SLOW);
-            }
-        } else if (state == ROBOT_INITIAL_SEARCH ||
-                   state == ROBOT_RECOVERY) {
-            unsigned timeout = (state == ROBOT_INITIAL_SEARCH)
-                             ? SEARCH_TIMEOUT_MS : RECOVERY_TIMEOUT_MS;
-            if (bits != 0U && bits != 5U) {
-                if (++seen >= FOUND_SAMPLES) {
-                    set_state(ROBOT_FOLLOW);
-                    robot_motion_command(0,0);
-                }
-            } else {
-                seen=0;
-            }
-            if (state != ROBOT_FOLLOW) {
-                if (state_elapsed >= timeout) {
-                    set_state(ROBOT_STOPPED);
-                    robot_motion_fault();
-                } else {
-                    /* First turn toward last-seen side for recovery.
-                     * Without a known direction, alternate small sweeps.
-                     * Timed sweeps are provisional until encoder control.
-                     */
-                    int side = (state == ROBOT_INITIAL_SEARCH)
-                             ? ((state_elapsed / 400U) % 2U ? 1 : -1)
-                             : (last_direction == 0
-                                 ? ((state_elapsed / 400U) % 2U ? 1 : -1)
-                                 : last_direction);
-                    robot_motion_command(
-                        side < 0 ? -SEARCH : SEARCH,
-                        side < 0 ? SEARCH : -SEARCH
-                    );
-                }
-            }
-        } else {
-            robot_motion_command(0,0);
+static int valid(unsigned b) { return b!=0 && b!=5; }
+static void task_line(INT stacd, void *exinf){
+    unsigned raw, previous=255U, logging=0;
+    (void)stacd;(void)exinf;
+    robot_motion_command(0,0);
+    tk_dly_tsk(STARTUP_SETTLE_MS);
+    tm_printf((UB*)"[LINE] sensor ready; black level=%u\n",IR_BLACK_LEVEL);
+    enter(ROBOT_STARTUP);
+    for(;;){
+        raw=read_line();
+        if(raw!=previous || ++logging>=50U){
+            tm_printf((UB*)"[IR] L=%u C=%u R=%u state=%d\n",(raw>>2)&1U,(raw>>1)&1U,raw&1U,(int)state);
+            previous=raw;logging=0;
         }
-        tk_dly_tsk(LINE_PERIOD_MS);
+        if(elapsed<500000U)elapsed+=PERIOD_MS;
+        switch(state){
+        case ROBOT_STARTUP:
+            robot_motion_command(0,0);
+            if(valid(raw)){
+                if(++present>=CONFIRM_SAMPLES)enter(ROBOT_FOLLOW);
+            }else present=0;
+            if(state==ROBOT_STARTUP && elapsed>=STARTUP_OBSERVE_MS) enter(ROBOT_INITIAL_SEARCH);
+            break;
+        case ROBOT_FOLLOW:
+            if(raw==0){
+                robot_motion_command(0,0); /* prevent continuing off line */
+                if(++absent>=LOSS_SAMPLES)enter(ROBOT_RECOVERY);
+            }else{
+                absent=0;
+                if(raw==4 || raw==6){last_side=-1;robot_motion_command(SLOW,CRUISE);}
+                else if(raw==1 || raw==3){last_side=1;robot_motion_command(CRUISE,SLOW);}
+                else if(raw==2){robot_motion_command(CRUISE,CRUISE);}
+                else {robot_motion_command(SLOW,SLOW);} /* wide / ambiguous */
+            }
+            break;
+        case ROBOT_INITIAL_SEARCH:
+        case ROBOT_RECOVERY:
+            if(valid(raw)){
+                if(++present>=CONFIRM_SAMPLES){
+                    enter(ROBOT_FOLLOW);
+                    robot_motion_command(0,0);
+                    break;
+                }
+            }else present=0;
+            if(elapsed>=((state==ROBOT_INITIAL_SEARCH)?SEARCH_LIMIT_MS:RECOVERY_LIMIT_MS)){
+                robot_motion_fault();enter(ROBOT_STOPPED);break;
+            }
+            {
+                /* alternating search sweep; recovery favors last known side */
+                int side = (state==ROBOT_RECOVERY && last_side!=0 && elapsed<650U)
+                         ? last_side
+                         : (((elapsed/350U)&1U)?1:-1);
+                robot_motion_command(side<0?-SWEEP:SWEEP,side<0?SWEEP:-SWEEP);
+            }
+            break;
+        default: robot_motion_fault();break;
+        }
+        tk_dly_tsk(PERIOD_MS);
     }
 }
-ER robot_line_init(void)
-{
-    const UINT pins[] = {IR_L,IR_C,IR_R};
-    UINT i;
-    for (i=0;i<3;++i) if (gpio_set_pin(pins[i],GPIO_MODE_IN)<E_OK) return -1;
-    state=ROBOT_STARTUP;
-    state_elapsed=seen=lost=0;
-    last_direction=0;
+ER robot_line_init(void){
+    const UINT pins[]={IR_L,IR_C,IR_R};
+    UINT i;ER er;
+    state=ROBOT_STARTUP;elapsed=present=absent=0;last_side=0;
+    for(i=0;i<3;i++)if((er=gpio_set_pin(pins[i],GPIO_MODE_IN))<E_OK)return er;
     return E_OK;
 }
-ER robot_line_start(void)
-{
-    line_tid=app_start_task((FP)line_task, 11, TP_PRC1, "robot_line");
-    return line_tid<E_OK ? line_tid:E_OK;
+ER robot_line_start(void){
+    tid_line=app_start_task((FP)task_line,11,TP_PRC1,"robot_line");
+    return tid_line<E_OK?tid_line:E_OK;
 }

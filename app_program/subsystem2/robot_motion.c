@@ -1,111 +1,81 @@
 #include "robot_motion.h"
+#include "drv_pwm.h"
 #include "../subsystem3/robot_line.h"
 
-/* Motor outputs: Cytron Robo Pico M1=GP8/9 M2=GP10/11.
- * Verify board driver and wheel polarity BEFORE enabling hardware.
- * Exclusive motor writer: this task only.
- */
-#define MOTOR_L_A 8U
-#define MOTOR_L_B 9U
-#define MOTOR_R_A 10U
-#define MOTOR_R_B 11U
-#define MOTOR_MAX_PERCENT 20
-#define MOTOR_PERIOD_MS 20U
-static volatile int requested_left;
-static volatile int requested_right;
-static volatile int emergency_stop;
-static ID motion_tid;
+#define MOTOR_L_A_PIN 8U
+#define MOTOR_L_B_PIN 9U
+#define MOTOR_R_A_PIN 10U
+#define MOTOR_R_B_PIN 11U
+#define MOTOR_L_SLICE 4U
+#define MOTOR_R_SLICE 5U
+#define MOTOR_PWM_HZ 10000U
+#define MOTOR_PWM_TOP (PWM_CLK_HZ / MOTOR_PWM_HZ - 1UL)
+#define MOTOR_TASK_MS 20U
 
-static int limit(int n)
-{
-    if (n > MOTOR_MAX_PERCENT) return MOTOR_MAX_PERCENT;
-    if (n < -MOTOR_MAX_PERCENT) return -MOTOR_MAX_PERCENT;
-    return n;
+static volatile int demand_left, demand_right, fault_latched;
+static ID motor_tid;
+static int limit(int v) {
+    if (v > MOTOR_PWM_MAX_PERCENT) return MOTOR_PWM_MAX_PERCENT;
+    if (v < -MOTOR_PWM_MAX_PERCENT) return -MOTOR_PWM_MAX_PERCENT;
+    return v;
 }
-
-#if ROBOT_MOTOR_ENABLE
-static void apply_one(UINT pin_f, UINT pin_r, int speed)
-{
-    /* Each motor uses one forward PWM and one reverse PWM.
-     * Requires confirmation of exact Robo Pico bridge mapping.
-     * pwm_set_cc takes the GPIO pin and channel compare value.
-     */
-    UW duty = (UW)((speed < 0 ? -speed : speed) * 100U);
-    if (speed > 0) {
-        pwm_set_cc(pin_r, 0);
-        pwm_set_cc(pin_f, duty);
-    } else if (speed < 0) {
-        pwm_set_cc(pin_f, 0);
-        pwm_set_cc(pin_r, duty);
-    } else {
-        pwm_set_cc(pin_f, 0);
-        pwm_set_cc(pin_r, 0);
-    }
+static void motor_write(UW slice, int percent) {
+    UW cc = ((UW)(percent < 0 ? -percent : percent) * (MOTOR_PWM_TOP + 1U))/100U;
+    if (percent > 0) pwm_slice_write_cc(slice,cc,0);
+    else if (percent < 0) pwm_slice_write_cc(slice,0,cc);
+    else pwm_slice_write_cc(slice,0,0);
 }
-#endif
-
-static void hardware_stop(void)
-{
-#if ROBOT_MOTOR_ENABLE
-    apply_one(MOTOR_L_A, MOTOR_L_B, 0);
-    apply_one(MOTOR_R_A, MOTOR_R_B, 0);
-#endif
+static void stop_hw(void) {
+    pwm_slice_write_cc(MOTOR_L_SLICE,0,0);
+    pwm_slice_write_cc(MOTOR_R_SLICE,0,0);
 }
-
-void robot_motion_command(int left_pct, int right_pct)
-{
-    /* Both tasks are pinned to core 0; command changes occur in
-     * the line task, and outputs are written only in motion task. */
-    requested_left = limit(left_pct);
-    requested_right = limit(right_pct);
+void robot_motion_command(int left, int right) {
+    if (fault_latched) return;
+    demand_left=limit(left);
+    demand_right=limit(right);
 }
-void robot_motion_stop(void)
-{
-    requested_left = 0;
-    requested_right = 0;
-    emergency_stop = 1;
-    /* Hardware output is disabled at the next motion task tick.
-       20 ms nominal, verify worst-case latency on target. */
+void robot_motion_stop(void) {
+    fault_latched=1;
+    demand_left=demand_right=0;
+    stop_hw();
 }
-void robot_motion_fault(void) { robot_motion_stop(); }
-
-static void motion_task(INT stacd, void *exinf)
-{
-    (void)stacd; (void)exinf;
+void robot_motion_fault(void) {robot_motion_stop();}
+static void task_motion(INT stacd, void *exinf) {
+    unsigned log_ticks=0;
+    int l,r;
+    (void)stacd;(void)exinf;
+    tm_printf((UB*)"[MOTOR] legacy PWM block initialized, 10 kHz\n");
     for (;;) {
-        int l = requested_left;
-        int r = requested_right;
-        if (emergency_stop || robot_line_is_faulted()) {
-            l = 0; r = 0;
+        l=demand_left; r=demand_right;
+        if (fault_latched || robot_line_is_faulted()) {l=r=0;stop_hw();}
+        else {
+            motor_write(MOTOR_L_SLICE,l*LEFT_FORWARD_SIGN);
+            motor_write(MOTOR_R_SLICE,r*RIGHT_FORWARD_SIGN);
         }
-#if ROBOT_MOTOR_ENABLE
-        apply_one(MOTOR_L_A, MOTOR_L_B, l);
-        apply_one(MOTOR_R_A, MOTOR_R_B, r);
-#else
-        (void)l; (void)r;
-#endif
-        tk_dly_tsk(MOTOR_PERIOD_MS);
+        if (++log_ticks >= 50U) {
+            log_ticks=0;
+            tm_printf((UB*)"[MOTOR] L=%d R=%d fault=%d state=%d\n",
+                       l,r,fault_latched,(int)robot_line_state());
+        }
+        tk_dly_tsk(MOTOR_TASK_MS);
     }
 }
-ER robot_motion_init(void)
-{
-    requested_left = requested_right = 0;
-    emergency_stop = 0;
-#if ROBOT_MOTOR_ENABLE
-    const UINT pins[] = {MOTOR_L_A,MOTOR_L_B,MOTOR_R_A,MOTOR_R_B};
-    UINT i;
-    for (i = 0; i < 4; ++i) {
-        if (pwm_set_pin(pins[i]) < E_OK) return -1;
-        if (pwm_set_wrap(pins[i], 9999U) < E_OK) return -1;
-        if (pwm_set_cc(pins[i], 0U) < E_OK) return -1;
-        if (pwm_set_enabled(pins[i], TRUE) < E_OK) return -1;
-    }
-#endif
-    hardware_stop();
+ER robot_motion_init(void) {
+    ER er;
+    if (!pwm_block_enable()) return E_IO;
+    pwm_slice_setup(MOTOR_L_SLICE,1U,MOTOR_PWM_TOP);
+    pwm_slice_setup(MOTOR_R_SLICE,1U,MOTOR_PWM_TOP);
+    if ((er=pwm_set_pin(MOTOR_L_A_PIN))<E_OK) return er;
+    if ((er=pwm_set_pin(MOTOR_L_B_PIN))<E_OK) return er;
+    if ((er=pwm_set_pin(MOTOR_R_A_PIN))<E_OK) return er;
+    if ((er=pwm_set_pin(MOTOR_R_B_PIN))<E_OK) return er;
+    fault_latched=0;demand_left=demand_right=0;
+    stop_hw();
+    tm_printf((UB*)"[MOTOR] GP8/9 GP10/11 slices 4/5 enabled; cap=%d%%\n",
+        MOTOR_PWM_MAX_PERCENT);
     return E_OK;
 }
-ER robot_motion_start(void)
-{
-    motion_tid = app_start_task((FP)motion_task, 10, TP_PRC1, "robot_motion");
-    return motion_tid < E_OK ? motion_tid : E_OK;
+ER robot_motion_start(void) {
+    motor_tid=app_start_task((FP)task_motion,10,TP_PRC1,"robot_motion");
+    return motor_tid<E_OK?motor_tid:E_OK;
 }
